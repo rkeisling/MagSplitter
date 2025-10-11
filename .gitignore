@@ -122,3 +122,18 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Fonts
+Fonts/
+
+# Data
+*.cbz
+*.cbr
+*.pdf
+*.rar
+*.zip
+*.7z
+
+# Output
+layouts/
+split/
