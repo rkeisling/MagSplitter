@@ -126,6 +126,9 @@ dmypy.json
 # Fonts
 Fonts/
 
+# Models
+Models/
+
 # Data
 *.cbz
 *.cbr
