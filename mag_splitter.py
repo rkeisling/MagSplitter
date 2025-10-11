@@ -51,6 +51,9 @@ EMPTY_TILE_THRESHOLD = 0.02
 CONTENT_TILE_MIN_STD = 15
 DEFAULT_SPLIT_SPREADS = True
 DEFAULT_SPREAD_THRESHOLD = 1.2
+COLOR_VARIANCE_THRESHOLD = 0.1
+UNIQUE_COLOR_THRESHOLD = 50
+SATURATION_VARIANCE_THRESHOLD = 0.05
 
 
 @dataclasses.dataclass
@@ -389,6 +392,84 @@ class PageMetrics:
     margin_empty_ratio: float
     text_coverage: float
     has_swt_text: bool
+    has_artistic_content: bool
+    color_variance_r: float
+    color_variance_g: float
+    color_variance_b: float
+    unique_colors: int
+    saturation_variance: float
+
+
+def calculate_channel_variance(image: Image.Image) -> Tuple[float, float, float]:
+    """
+    Calculate standard deviation for each RGB channel separately.
+    Returns: (r_variance, g_variance, b_variance) normalized to 0-1 range.
+    Research shows std_dev > 0.1 indicates content/features in that channel.
+    """
+    rgb = image.convert("RGB")
+    r_band, g_band, b_band = rgb.split()
+
+    r_stat = ImageStat.Stat(r_band)
+    g_stat = ImageStat.Stat(g_band)
+    b_stat = ImageStat.Stat(b_band)
+
+    r_variance = r_stat.stddev[0] / 255.0
+    g_variance = g_stat.stddev[0] / 255.0
+    b_variance = b_stat.stddev[0] / 255.0
+
+    return r_variance, g_variance, b_variance
+
+
+def count_unique_colors(image: Image.Image, sample_size: Tuple[int, int] = (256, 256)) -> int:
+    """
+    Count approximate number of unique colors in image.
+    Uses a downsampled version for performance.
+    Illustrations typically have many distinct colors.
+    """
+    small = image.resize(sample_size, Image.BILINEAR)
+    rgb = small.convert("RGB")
+    colors = rgb.getcolors(maxcolors=sample_size[0] * sample_size[1])
+    return len(colors) if colors else 0
+
+
+def calculate_saturation_variance(image: Image.Image) -> float:
+    """
+    Calculate variance in saturation channel.
+    Artistic content typically has varied saturation levels.
+    """
+    hsv = image.convert("HSV")
+    h_band, s_band, v_band = hsv.split()
+    s_stat = ImageStat.Stat(s_band)
+    return s_stat.stddev[0] / 255.0
+
+
+def has_illustration_content(
+    color_var_r: float,
+    color_var_g: float,
+    color_var_b: float,
+    unique_colors: int,
+    saturation_variance: float
+) -> bool:
+    """
+    Determine if page contains artistic/illustration content.
+
+    Indicators of artistic content:
+    - High color variance in any RGB channel (>0.1)
+    - Many unique colors (>50)
+    - High saturation variance (>0.05)
+
+    Returns True if page likely contains intentional artwork/illustration.
+    """
+    has_color_variance = (
+        color_var_r > COLOR_VARIANCE_THRESHOLD or
+        color_var_g > COLOR_VARIANCE_THRESHOLD or
+        color_var_b > COLOR_VARIANCE_THRESHOLD
+    )
+
+    has_color_diversity = unique_colors > UNIQUE_COLOR_THRESHOLD
+    has_saturation_variation = saturation_variance > SATURATION_VARIANCE_THRESHOLD
+
+    return has_color_variance or has_color_diversity or has_saturation_variation
 
 
 def crop_margins(image: Image.Image, margin_percent: float) -> Image.Image:
@@ -399,10 +480,10 @@ def crop_margins(image: Image.Image, margin_percent: float) -> Image.Image:
     return image.crop((margin_x, margin_y, width - margin_x, height - margin_y))
 
 
-def analyze_tile_content(tile: Image.Image) -> Tuple[float, float, float]:
+def analyze_tile_content(tile: Image.Image) -> Tuple[float, float, float, float]:
     """
     Analyze a single tile to determine if it contains content.
-    Returns: (std_dev, edge_density, dark_pixel_ratio)
+    Returns: (std_dev, edge_density, dark_pixel_ratio, max_color_variance)
     """
     grayscale = tile.convert("L")
     stat = ImageStat.Stat(grayscale)
@@ -416,11 +497,21 @@ def analyze_tile_content(tile: Image.Image) -> Tuple[float, float, float]:
     dark_pixels = sum(histogram[:200])
     dark_ratio = dark_pixels / pixel_count if pixel_count > 0 else 0
 
-    return std_dev, edge_density, dark_ratio
+    r_var, g_var, b_var = calculate_channel_variance(tile)
+    max_color_variance = max(r_var, g_var, b_var)
+
+    return std_dev, edge_density, dark_ratio, max_color_variance
 
 
-def is_tile_empty(std_dev: float, edge_density: float, dark_ratio: float) -> bool:
-    """Determine if a tile is empty based on its metrics."""
+def is_tile_empty(std_dev: float, edge_density: float, dark_ratio: float, max_color_variance: float) -> bool:
+    """
+    Determine if a tile is empty based on its metrics.
+    A tile with high color variance in any channel is considered to have content.
+    """
+    has_color_content = max_color_variance > COLOR_VARIANCE_THRESHOLD
+    if has_color_content:
+        return False
+
     return std_dev < CONTENT_TILE_MIN_STD and edge_density < EMPTY_TILE_THRESHOLD and dark_ratio < 0.1
 
 
@@ -451,9 +542,9 @@ def analyze_page_tiles(image: Image.Image, grid_size: Tuple[int, int]) -> Tuple[
             bottom = min(top + tile_height, height)
 
             tile = image.crop((left, top, right, bottom))
-            std_dev, edge_density, dark_ratio = analyze_tile_content(tile)
+            std_dev, edge_density, dark_ratio, max_color_variance = analyze_tile_content(tile)
 
-            if is_tile_empty(std_dev, edge_density, dark_ratio):
+            if is_tile_empty(std_dev, edge_density, dark_ratio, max_color_variance):
                 empty_count += 1
                 if is_margin:
                     margin_empty_count += 1
@@ -556,6 +647,14 @@ def evaluate_page_image(
 
         text_coverage, has_swt_text = detect_text_with_swt(rgb)
 
+        color_var_r, color_var_g, color_var_b = calculate_channel_variance(small)
+        unique_colors = count_unique_colors(small)
+        saturation_variance = calculate_saturation_variance(small)
+
+        has_artistic_content = has_illustration_content(
+            color_var_r, color_var_g, color_var_b, unique_colors, saturation_variance
+        )
+
     return PageMetrics(
         path=page_path,
         aspect_ratio=aspect_ratio,
@@ -570,6 +669,12 @@ def evaluate_page_image(
         margin_empty_ratio=margin_empty_ratio,
         text_coverage=text_coverage,
         has_swt_text=has_swt_text,
+        has_artistic_content=has_artistic_content,
+        color_variance_r=color_var_r,
+        color_variance_g=color_var_g,
+        color_variance_b=color_var_b,
+        unique_colors=unique_colors,
+        saturation_variance=saturation_variance,
     )
 
 
@@ -594,12 +699,12 @@ def filter_pages(
 
             if not metrics.aspect_valid:
                 remove_reason = f"aspect ratio {metrics.aspect_ratio:.2f} outside [{min_aspect_ratio}, {max_aspect_ratio}]"
-            elif metrics.empty_tile_ratio >= plain_threshold:
-                remove_reason = f"empty tile ratio {metrics.empty_tile_ratio:.2f} ≥ {plain_threshold}"
-            elif metrics.plain_ratio >= plain_threshold:
-                remove_reason = f"plain/text ratio {metrics.plain_ratio:.2f} ≥ {plain_threshold} (undecorated)"
-            elif threshold > 0 and metrics.interest_score < threshold:
-                remove_reason = f"interest score {metrics.interest_score:.3f} < {threshold}"
+            elif metrics.empty_tile_ratio >= plain_threshold and not metrics.has_artistic_content:
+                remove_reason = f"empty tile ratio {metrics.empty_tile_ratio:.2f} ≥ {plain_threshold} (no artistic content)"
+            elif metrics.plain_ratio >= plain_threshold and not metrics.has_artistic_content:
+                remove_reason = f"plain/text ratio {metrics.plain_ratio:.2f} ≥ {plain_threshold} (no artistic content)"
+            elif threshold > 0 and metrics.interest_score < threshold and not metrics.has_artistic_content:
+                remove_reason = f"interest score {metrics.interest_score:.3f} < {threshold} (no artistic content)"
 
             if remove_reason:
                 removed += 1
@@ -613,10 +718,12 @@ def filter_pages(
             else:
                 kept += 1
                 if verbose:
+                    artistic = "ART" if metrics.has_artistic_content else "no-art"
                     print(
                         f"Keeping {page_path}: empty_tiles {metrics.empty_tile_ratio:.2f}, "
-                        f"text {metrics.text_coverage:.2f}, plain {metrics.plain_ratio:.2f}, "
-                        f"interest {metrics.interest_score:.3f}, aspect {metrics.aspect_ratio:.2f}"
+                        f"plain {metrics.plain_ratio:.2f}, text {metrics.text_coverage:.2f}, "
+                        f"interest {metrics.interest_score:.3f}, [{artistic}], "
+                        f"colors {metrics.unique_colors}, aspect {metrics.aspect_ratio:.2f}"
                     )
     return kept, removed
 
