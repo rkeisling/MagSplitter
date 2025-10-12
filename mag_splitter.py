@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import random
 import re
 import shutil
 import subprocess
@@ -27,6 +28,14 @@ IMAGE_LEFT_OFFSET = 60
 IMAGE_PANEL_GAP = 18
 IMAGE_TOP_MARGIN = 4
 IMAGE_BOTTOM_MARGIN = 4
+WALLPAPER_4K_SIZE = (3840, 2160)
+WALLPAPER_1440P_SIZE = (2560, 1440)
+WALLPAPER_BACKGROUND = (8, 8, 8)
+WALLPAPER_OUTER_MARGIN = 40
+WALLPAPER_CENTER_GAP = 60
+WALLPAPER_TEXT_MARGIN_WIDTH = 80
+WALLPAPER_TEXT_PADDING = 20
+DEFAULT_WALLPAPER_QUALITY = 82
 MAX_FONT_SIZE = 48
 MIN_FONT_SIZE = 16
 FONT_SIZE_REDUCTION = 10
@@ -164,23 +173,37 @@ def split_zip_archive(archive_path: Path, output_root: Path, split_spreads: bool
 
     issue_name = sanitise_issue_name(archive_path.stem)
     issue_dir = output_root / issue_name
+
+    # Check if issue already has extracted pages
+    if issue_dir.exists():
+        existing_pages = list(issue_dir.glob("page*.jpg"))
+        if existing_pages:
+            print(f"  Skipping (already extracted {len(existing_pages)} pages)")
+            return existing_pages
+
     issue_dir.mkdir(parents=True, exist_ok=True)
 
     extracted_paths: List[Path] = []
     page_index = 1
     with zipfile.ZipFile(archive_path) as archive:
         members = [m for m in archive.namelist() if not m.endswith("/")]
+        # Filter out macOS metadata files
+        members = [m for m in members if not m.startswith('__MACOSX/') and not m.split('/')[-1].startswith('._')]
         members.sort(key=numeric_key_from_string)
         for member in members:
-            with archive.open(member) as member_file:
-                with Image.open(member_file) as img:
-                    img = img.convert("RGB")
-                    pages = split_double_page(img, split_spreads, spread_threshold)
-                    for page in pages:
-                        output_path = issue_dir / f"page{page_index:03d}.jpg"
-                        page.save(output_path, format="JPEG", quality=95, optimize=True)
-                        extracted_paths.append(output_path)
-                        page_index += 1
+            try:
+                with archive.open(member) as member_file:
+                    with Image.open(member_file) as img:
+                        img = img.convert("RGB")
+                        pages = split_double_page(img, split_spreads, spread_threshold)
+                        for page in pages:
+                            output_path = issue_dir / f"page{page_index:03d}.jpg"
+                            page.save(output_path, format="JPEG", quality=95, optimize=True)
+                            extracted_paths.append(output_path)
+                            page_index += 1
+            except (OSError, UnidentifiedImageError) as e:
+                print(f"  Warning: Skipping corrupted/invalid image '{member}': {e}")
+                continue
     return extracted_paths
 
 
@@ -210,6 +233,14 @@ def split_rar_archive(archive_path: Path, output_root: Path, split_spreads: bool
 
     issue_name = sanitise_issue_name(archive_path.stem)
     issue_dir = output_root / issue_name
+
+    # Check if issue already has extracted pages
+    if issue_dir.exists():
+        existing_pages = list(issue_dir.glob("page*.jpg"))
+        if existing_pages:
+            print(f"  Skipping (already extracted {len(existing_pages)} pages)")
+            return existing_pages
+
     issue_dir.mkdir(parents=True, exist_ok=True)
 
     extracted_paths: List[Path] = []
@@ -225,7 +256,9 @@ def split_rar_archive(archive_path: Path, output_root: Path, split_spreads: bool
             raise SystemExit(f"Failed to extract {archive_path} using {tool}: {stderr or 'unknown error'}")
 
         page_index = 1
-        for candidate in sorted((p for p in temp_path.rglob("*") if p.is_file()), key=page_sort_key):
+        # Filter out macOS metadata files and directories
+        candidates = [p for p in temp_path.rglob("*") if p.is_file() and '__MACOSX' not in p.parts and not p.name.startswith('._')]
+        for candidate in sorted(candidates, key=page_sort_key):
             try:
                 with Image.open(candidate) as img:
                     img = img.convert("RGB")
@@ -235,7 +268,8 @@ def split_rar_archive(archive_path: Path, output_root: Path, split_spreads: bool
                         page.save(output_path, format="JPEG", quality=95, optimize=True)
                         extracted_paths.append(output_path)
                         page_index += 1
-            except UnidentifiedImageError:
+            except (OSError, UnidentifiedImageError) as e:
+                print(f"  Warning: Skipping corrupted/invalid image '{candidate.name}': {e}")
                 continue
 
     if not extracted_paths:
@@ -251,6 +285,14 @@ def split_pdf_document(pdf_path: Path, output_root: Path, split_spreads: bool = 
 
     issue_name = sanitise_issue_name(pdf_path.stem)
     issue_dir = output_root / issue_name
+
+    # Check if issue already has extracted pages
+    if issue_dir.exists():
+        existing_pages = list(issue_dir.glob("page*.jpg"))
+        if existing_pages:
+            print(f"  Skipping (already extracted {len(existing_pages)} pages)")
+            return existing_pages
+
     issue_dir.mkdir(parents=True, exist_ok=True)
 
     extracted_paths: List[Path] = []
@@ -276,14 +318,18 @@ def split_pdf_document(pdf_path: Path, output_root: Path, split_spreads: bool = 
             raise SystemExit(f"No images were produced when converting {pdf_path}.")
 
         for candidate in generated:
-            with Image.open(candidate) as img:
-                img = img.convert("RGB")
-                pages = split_double_page(img, split_spreads, spread_threshold)
-                for page in pages:
-                    output_path = issue_dir / f"page{page_index:03d}.jpg"
-                    page.save(output_path, format="JPEG", quality=95, optimize=True)
-                    extracted_paths.append(output_path)
-                    page_index += 1
+            try:
+                with Image.open(candidate) as img:
+                    img = img.convert("RGB")
+                    pages = split_double_page(img, split_spreads, spread_threshold)
+                    for page in pages:
+                        output_path = issue_dir / f"page{page_index:03d}.jpg"
+                        page.save(output_path, format="JPEG", quality=95, optimize=True)
+                        extracted_paths.append(output_path)
+                        page_index += 1
+            except (OSError, UnidentifiedImageError) as e:
+                print(f"  Warning: Skipping corrupted/invalid image '{candidate.name}': {e}")
+                continue
 
     return extracted_paths
 
@@ -297,15 +343,57 @@ def generate_random_name(used: Set[str]) -> str:
         return token
 
 
-def split_publication(source_path: Path, output_root: Path, split_spreads: bool = True, spread_threshold: float = 1.2) -> List[Path]:
+def detect_archive_type(source_path: Path) -> str:
+    """
+    Detect the actual archive type by reading file signatures,
+    not just relying on file extension (since .cbr files can be ZIP or RAR).
+    """
+    try:
+        with open(source_path, 'rb') as f:
+            header = f.read(8)
+
+            # ZIP signature: PK\x03\x04 or PK\x05\x06 or PK\x07\x08
+            if header[:2] == b'PK':
+                return 'zip'
+
+            # RAR signatures
+            # RAR 1.5-4.x: Rar!\x1a\x07\x00 or Rar!\x1a\x07\x01
+            if header[:4] == b'Rar!':
+                return 'rar'
+
+            # RAR 5.0+: Rar!\x1a\x07\x01\x00
+            if header[:7] == b'Rar!\x1a\x07\x01':
+                return 'rar'
+
+            # PDF signature: %PDF
+            if header[:4] == b'%PDF':
+                return 'pdf'
+    except Exception:
+        pass
+
+    # Fallback to extension if signature detection fails
     suffix = source_path.suffix.lower()
     if suffix in ZIP_EXTENSIONS:
-        return split_zip_archive(source_path, output_root, split_spreads, spread_threshold)
+        return 'zip'
     if suffix in RAR_EXTENSIONS:
-        return split_rar_archive(source_path, output_root, split_spreads, spread_threshold)
+        return 'rar'
     if suffix in PDF_EXTENSIONS:
+        return 'pdf'
+
+    return 'unknown'
+
+
+def split_publication(source_path: Path, output_root: Path, split_spreads: bool = True, spread_threshold: float = 1.2) -> List[Path]:
+    archive_type = detect_archive_type(source_path)
+
+    if archive_type == 'zip':
+        return split_zip_archive(source_path, output_root, split_spreads, spread_threshold)
+    if archive_type == 'rar':
+        return split_rar_archive(source_path, output_root, split_spreads, spread_threshold)
+    if archive_type == 'pdf':
         return split_pdf_document(source_path, output_root, split_spreads, spread_threshold)
-    raise SystemExit(f"Unsupported file extension {suffix} for {source_path}.")
+
+    raise SystemExit(f"Unsupported or unrecognized file type for {source_path}.")
 
 
 def parse_issue_metadata(issue_dir: Path) -> IssueMetadata:
@@ -317,7 +405,7 @@ def parse_issue_metadata(issue_dir: Path) -> IssueMetadata:
             re.IGNORECASE,
         ),
         re.compile(
-            r"^(?P<title>.+?)\s*(?:Issue\s*(?P<number>\d+))?\s*(?:\((?P<month>[A-Za-z]+)\s*(?P<year>\d{4})\))?$",
+            r"^(?P<title>.+?)\s*(?:Vol\s*(?P<volume>\d+)\s*)?(?:Issue\s*(?P<number>\d+))?\s*(?:\((?P<month>[A-Za-z]+)\s*(?P<year>\d{4})\))?$",
             re.IGNORECASE,
         ),
     ]
@@ -684,7 +772,7 @@ def filter_pages(
     plain_threshold: float,
     min_aspect_ratio: float,
     max_aspect_ratio: float,
-    delete: bool,
+    apply_filter: bool,
     verbose: bool,
 ) -> Tuple[int, int]:
     removed = 0
@@ -709,12 +797,18 @@ def filter_pages(
             if remove_reason:
                 removed += 1
                 if verbose:
-                    print(f"Removing {page_path}: {remove_reason}")
-                if delete:
+                    print(f"Filtering {page_path}: {remove_reason}")
+                if apply_filter:
+                    # Move to "filtered" subfolder
+                    filtered_dir = issue_dir / "filtered"
+                    filtered_dir.mkdir(exist_ok=True)
+                    dest_path = filtered_dir / page_path.name
                     try:
-                        page_path.unlink()
+                        page_path.rename(dest_path)
+                        if verbose:
+                            print(f"  Moved to {dest_path}")
                     except OSError as exc:
-                        print(f"Failed to delete {page_path}: {exc}")
+                        print(f"Failed to move {page_path}: {exc}")
             else:
                 kept += 1
                 if verbose:
@@ -785,6 +879,81 @@ def fit_image(image: Image.Image, target_width: int, target_height: int) -> Imag
 def build_page_label(page_index: int, total_pages: int) -> str:
     digits = max(3, len(str(total_pages)))
     return f"Page {page_index:0{digits}d}/{total_pages:0{digits}d}"
+
+
+def draw_vertical_text(
+    canvas: Image.Image,
+    text_lines: List[str],
+    position: Tuple[int, int],
+    font: ImageFont.FreeTypeFont,
+    font_path: Path,
+    color: Tuple[int, int, int],
+    max_height: int,
+    random_offset_y: int = 0,
+    random_offset_x: int = 0
+) -> None:
+    """
+    Draw vertical text (bottom to top) in the margin.
+    Text is drawn horizontally on a temporary image, rotated, then pasted onto canvas.
+    Supports random_offset_x and random_offset_y for OLED burn-in prevention.
+    Automatically reduces font size if text is too long to fit in max_height.
+    """
+    combined_text = " - ".join(text_lines)
+
+    # Start with the provided font
+    original_font_size = font.size
+    current_font = font
+
+    # Try to fit the text, reducing font size if necessary
+    temp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+
+    # IMPORTANT: After rotation by 90 degrees, the text WIDTH becomes the HEIGHT on screen
+    # So we need to check text_width against max_height
+    max_allowed_height = max_height - 80  # Leave more padding for safety
+
+    # Reduce font size until text fits
+    iteration = 0
+    while text_width > max_allowed_height and current_font.size > 12:
+        iteration += 1
+        new_size = int(current_font.size * 0.85)  # Reduce by 15% (more aggressive)
+        if new_size < 12:
+            new_size = 12
+        if iteration == 1:  # Only print on first reduction
+            print(f"[DEBUG] Text too long ({text_width}px > {max_allowed_height}px), reducing font from {current_font.size} to {new_size}")
+        current_font = ImageFont.truetype(str(font_path), size=new_size)
+        bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+    if iteration > 0:
+        print(f"[DEBUG] Final: font size {current_font.size}, text width {text_width}px")
+
+    # Now draw with the appropriately sized font
+    bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+
+    temp_width = text_width + 40
+    temp_height = text_height + 40
+
+    temp = Image.new("RGBA", (temp_width, temp_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(temp)
+
+    text_x = 20
+    text_y = temp_height // 2
+    draw.text((text_x, text_y), combined_text, font=current_font, fill=color, anchor="lm")
+
+    rotated = temp.rotate(90, expand=True)
+
+    x, y = position
+    x_offset = x + random_offset_x
+    y_centered = y + (max_height - rotated.height) // 2 + random_offset_y
+
+    if rotated.width > 0 and rotated.height > 0:
+        canvas.paste(rotated, (x_offset, y_centered), rotated)
 
 
 def render_info_panel(
@@ -915,6 +1084,94 @@ def layout_single(page_path: Path, metadata: IssueMetadata, page_label: str, fon
         canvas.save(output_path, format="JPEG", quality=95, optimize=True)
 
 
+def layout_wallpaper(
+    page_path1: Path,
+    metadata1: IssueMetadata,
+    page_label1: str,
+    page_path2: Path,
+    metadata2: IssueMetadata,
+    page_label2: str,
+    font_path: Path,
+    output_path: Path,
+    resolution: Tuple[int, int],
+    quality: int
+) -> None:
+    """
+    Create a wallpaper layout with two magazine pages side-by-side.
+    Vertical metadata text appears in the right margin of each page.
+    """
+    canvas_width, canvas_height = resolution
+
+    canvas = Image.new("RGB", (canvas_width, canvas_height), WALLPAPER_BACKGROUND)
+
+    available_height = canvas_height - 2 * WALLPAPER_OUTER_MARGIN
+    half_width = (canvas_width - WALLPAPER_CENTER_GAP - 2 * WALLPAPER_OUTER_MARGIN) // 2
+    page_area_width = half_width - WALLPAPER_TEXT_MARGIN_WIDTH
+
+    font = ensure_font(font_path, size=28)
+
+    with Image.open(page_path1) as img1:
+        img1 = img1.convert("RGB")
+        fitted1 = fit_image(img1, page_area_width, available_height)
+
+        # Center the image horizontally within its allocated space, with random offset for burn-in prevention
+        page_offset_x1 = random.randint(-60, 60)
+        page_offset_y1 = random.randint(-40, 40)
+        x1 = WALLPAPER_OUTER_MARGIN + (page_area_width - fitted1.width) // 2 + page_offset_x1
+        y1 = WALLPAPER_OUTER_MARGIN + (available_height - fitted1.height) // 2 + page_offset_y1
+        canvas.paste(fitted1, (x1, y1))
+
+        text_lines1 = []
+        if metadata1.title:
+            text_lines1.append(metadata1.title)
+        if metadata1.issue_number:
+            text_lines1.append(f"#{metadata1.issue_number}")
+        if metadata1.month and metadata1.year:
+            text_lines1.append(f"{metadata1.month} {metadata1.year}")
+        elif metadata1.year:
+            text_lines1.append(metadata1.year)
+        text_lines1.append(page_label1)
+
+        # Position text at the right edge of the allocated page area
+        text_x1 = WALLPAPER_OUTER_MARGIN + page_area_width + WALLPAPER_TEXT_PADDING
+        text_y1 = WALLPAPER_OUTER_MARGIN
+        offset_y1 = random.randint(-50, 50)
+        offset_x1 = random.randint(-20, 20)
+        draw_vertical_text(canvas, text_lines1, (text_x1, text_y1), font, font_path, INFO_PANEL_TEXT_COLOR, available_height, offset_y1, offset_x1)
+
+    with Image.open(page_path2) as img2:
+        img2 = img2.convert("RGB")
+        fitted2 = fit_image(img2, page_area_width, available_height)
+
+        # Center the image horizontally within its allocated space, with random offset for burn-in prevention
+        page2_left_edge = WALLPAPER_OUTER_MARGIN + half_width + WALLPAPER_CENTER_GAP
+        page_offset_x2 = random.randint(-60, 60)
+        page_offset_y2 = random.randint(-40, 40)
+        x2 = page2_left_edge + (page_area_width - fitted2.width) // 2 + page_offset_x2
+        y2 = WALLPAPER_OUTER_MARGIN + (available_height - fitted2.height) // 2 + page_offset_y2
+        canvas.paste(fitted2, (x2, y2))
+
+        text_lines2 = []
+        if metadata2.title:
+            text_lines2.append(metadata2.title)
+        if metadata2.issue_number:
+            text_lines2.append(f"#{metadata2.issue_number}")
+        if metadata2.month and metadata2.year:
+            text_lines2.append(f"{metadata2.month} {metadata2.year}")
+        elif metadata2.year:
+            text_lines2.append(metadata2.year)
+        text_lines2.append(page_label2)
+
+        # Position text at the right edge of the allocated page area
+        text_x2 = page2_left_edge + page_area_width + WALLPAPER_TEXT_PADDING
+        text_y2 = WALLPAPER_OUTER_MARGIN
+        offset_y2 = random.randint(-50, 50)
+        offset_x2 = random.randint(-20, 20)
+        draw_vertical_text(canvas, text_lines2, (text_x2, text_y2), font, font_path, INFO_PANEL_TEXT_COLOR, available_height, offset_y2, offset_x2)
+
+    canvas.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
+
+
 def generate_layouts(
     pages_root: Path,
     output_root: Path,
@@ -944,6 +1201,77 @@ def generate_layouts(
             dest_dir.mkdir(parents=True, exist_ok=True)
             layout_single(page_path, metadata, page_label, font_path, dest)
             created.append(dest)
+    return created
+
+
+def generate_wallpapers(
+    pages_root: Path,
+    output_root: Path,
+    font_path: Path,
+    resolution: Tuple[int, int],
+    quality: int,
+    max_wallpapers: int = 0
+) -> List[Path]:
+    """
+    Generate wallpapers with randomly paired pages from different magazines.
+    Ensures each wallpaper has pages from two different issues.
+    """
+    import random
+
+    created: List[Path] = []
+    used_names: Set[str] = set()
+
+    issue_pages: List[Tuple[Path, Path, IssueMetadata, str]] = []
+
+    issue_dirs = sorted([p for p in pages_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+
+    for issue_dir in issue_dirs:
+        page_files: List[Path] = []
+        for pattern in ("*.jpg", "*.jpeg", "*.png"):
+            page_files.extend(sorted(issue_dir.glob(pattern), key=page_sort_key))
+        if not page_files:
+            continue
+
+        total_pages = len(page_files)
+        metadata = parse_issue_metadata(issue_dir)
+
+        for index, page_path in enumerate(page_files, start=1):
+            page_label = build_page_label(index, total_pages)
+            issue_pages.append((page_path, issue_dir, metadata, page_label))
+
+    if len(issue_pages) < 2:
+        return created
+
+    random.shuffle(issue_pages)
+
+    pairs_created = 0
+    i = 0
+
+    while i < len(issue_pages) - 1:
+        page1_path, issue1_dir, metadata1, label1 = issue_pages[i]
+        page2_path, issue2_dir, metadata2, label2 = issue_pages[i + 1]
+
+        if issue1_dir.name == issue2_dir.name:
+            i += 1
+            continue
+
+        random_name = generate_random_name(used_names)
+        dest = output_root / f"{random_name}.jpg"
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        layout_wallpaper(
+            page1_path, metadata1, label1,
+            page2_path, metadata2, label2,
+            font_path, dest, resolution, quality
+        )
+
+        created.append(dest)
+        pairs_created += 1
+        i += 2
+
+        if max_wallpapers > 0 and pairs_created >= max_wallpapers:
+            break
+
     return created
 
 
@@ -1003,9 +1331,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum allowed width/height ratio for a page (filters out double-page spreads).",
     )
     filter_parser.add_argument(
-        "--delete",
+        "--apply",
         action="store_true",
-        help="Delete pages that fail the filter. Otherwise only report counts.",
+        help="Move filtered pages to 'filtered' subfolder within each issue directory. Otherwise only report counts.",
     )
     filter_parser.add_argument(
         "--verbose",
@@ -1013,7 +1341,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Print per-page decisions while filtering.",
     )
 
-    layout_parser = subparsers.add_parser("layout", help="Create 1024x600 single-page layouts from extracted images.")
+    layout_parser = subparsers.add_parser("layout", help="Create 1024x600 single-page layouts or 16:9 wallpapers from extracted images.")
     layout_parser.add_argument("--input-dir", default="split", help="Directory containing extracted page images.")
     layout_parser.add_argument("--output-dir", default="layouts", help="Directory to store generated layouts.")
     layout_parser.add_argument("--font", default="Fonts/lucasarts-scumm-solid.ttf", help="Path to the TrueType font file.")
@@ -1021,6 +1349,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--flatten",
         action="store_true",
         help="Write all generated layouts into a single directory instead of per-issue folders.",
+    )
+    layout_parser.add_argument(
+        "--mode",
+        choices=["single", "wallpaper"],
+        default="single",
+        help="Layout mode: 'single' for 1024x600 WigiDash layout, 'wallpaper' for 16:9 dual-page wallpapers.",
+    )
+    layout_parser.add_argument(
+        "--wallpaper-resolution",
+        choices=["4k", "1440p"],
+        default="4k",
+        help="Wallpaper resolution: '4k' (3840x2160) or '1440p' (2560x1440).",
+    )
+    layout_parser.add_argument(
+        "--wallpaper-quality",
+        type=int,
+        default=DEFAULT_WALLPAPER_QUALITY,
+        help="JPEG quality for wallpapers (1-100). Default 82 balances quality and file size.",
+    )
+    layout_parser.add_argument(
+        "--max-wallpapers",
+        type=int,
+        default=0,
+        help="Maximum number of wallpapers to generate (0 = unlimited).",
     )
 
     return parser
@@ -1051,13 +1403,13 @@ def main() -> None:
             plain_threshold=args.plain_threshold,
             min_aspect_ratio=args.min_aspect,
             max_aspect_ratio=args.max_aspect,
-            delete=args.delete,
+            apply_filter=args.apply,
             verbose=args.verbose,
         )
-        action = "Deleted" if args.delete else "Flagged"
+        action = "Moved" if args.apply else "Flagged"
         print(f"{action} {removed} pages; kept {kept}.")
-        if not args.delete:
-            print("Re-run with --delete to remove the flagged pages from disk.")
+        if not args.apply:
+            print("Re-run with --apply to move the flagged pages to 'filtered' subfolders.")
 
     elif args.command == "layout":
         pages_root = Path(args.input_dir)
@@ -1067,11 +1419,23 @@ def main() -> None:
             parser.error(f"Input directory {pages_root} does not exist.")
         if not font_path.exists():
             parser.error(f"Font file {font_path} does not exist.")
-        created = generate_layouts(pages_root, output_root, font_path, args.flatten)
-        if not created:
-            print("No page images found. Run the split command first.")
+
+        if args.mode == "wallpaper":
+            resolution = WALLPAPER_4K_SIZE if args.wallpaper_resolution == "4k" else WALLPAPER_1440P_SIZE
+            created = generate_wallpapers(
+                pages_root, output_root, font_path,
+                resolution, args.wallpaper_quality, args.max_wallpapers
+            )
+            if not created:
+                print("No page images found. Run the split command first.")
+            else:
+                print(f"Created {len(created)} {args.wallpaper_resolution} wallpapers under {output_root}")
         else:
-            print(f"Created {len(created)} layouts under {output_root}")
+            created = generate_layouts(pages_root, output_root, font_path, args.flatten)
+            if not created:
+                print("No page images found. Run the split command first.")
+            else:
+                print(f"Created {len(created)} layouts under {output_root}")
 
 
 if __name__ == "__main__":
