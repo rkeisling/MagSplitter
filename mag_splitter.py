@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, List, Set, Tuple
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError
 
 CANVAS_SIZE = (1024, 600)
 CANVAS_BACKGROUND = (8, 8, 8)
@@ -30,7 +30,7 @@ IMAGE_TOP_MARGIN = 4
 IMAGE_BOTTOM_MARGIN = 4
 WALLPAPER_4K_SIZE = (3840, 2160)
 WALLPAPER_1440P_SIZE = (2560, 1440)
-WALLPAPER_BACKGROUND = (8, 8, 8)
+WALLPAPER_BACKGROUND = (0, 0, 0)
 WALLPAPER_OUTER_MARGIN = 40
 WALLPAPER_CENTER_GAP = 60
 WALLPAPER_TEXT_MARGIN_WIDTH = 80
@@ -63,6 +63,9 @@ DEFAULT_SPREAD_THRESHOLD = 1.2
 COLOR_VARIANCE_THRESHOLD = 0.1
 UNIQUE_COLOR_THRESHOLD = 50
 SATURATION_VARIANCE_THRESHOLD = 0.05
+HIGHLIGHT_THRESHOLD = 230
+HIGHLIGHT_REDUCTION_FACTOR = 0.7
+HIGHLIGHT_SOFTNESS = 8
 
 
 @dataclasses.dataclass
@@ -881,47 +884,54 @@ def build_page_label(page_index: int, total_pages: int) -> str:
     return f"Page {page_index:0{digits}d}/{total_pages:0{digits}d}"
 
 
-def draw_vertical_text(
-    canvas: Image.Image,
+def reduce_highlights(
+    image: Image.Image,
+    threshold: int = HIGHLIGHT_THRESHOLD,
+    factor: float = HIGHLIGHT_REDUCTION_FACTOR,
+    softness: int = HIGHLIGHT_SOFTNESS,
+) -> Image.Image:
+    """
+    Dim only the brightest areas of the page to ease OLED load without muting midtones.
+    """
+    if image.mode != "RGB":
+        working = image.convert("RGB")
+    else:
+        working = image
+    luminance = working.convert("L")
+    mask = luminance.point(lambda v: 255 if v >= threshold else 0)
+    if softness > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(softness))
+    if mask.getbbox() is None:
+        return working
+    darker = ImageEnhance.Brightness(working).enhance(factor)
+    return Image.composite(darker, working, mask)
+
+
+def prepare_vertical_text_image(
     text_lines: List[str],
-    position: Tuple[int, int],
     font: ImageFont.FreeTypeFont,
     font_path: Path,
     color: Tuple[int, int, int],
     max_height: int,
-    random_offset_y: int = 0,
-    random_offset_x: int = 0
-) -> None:
-    """
-    Draw vertical text (bottom to top) in the margin.
-    Text is drawn horizontally on a temporary image, rotated, then pasted onto canvas.
-    Supports random_offset_x and random_offset_y for OLED burn-in prevention.
-    Automatically reduces font size if text is too long to fit in max_height.
-    """
+) -> Image.Image:
     combined_text = " - ".join(text_lines)
 
-    # Start with the provided font
-    original_font_size = font.size
     current_font = font
 
-    # Try to fit the text, reducing font size if necessary
     temp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
 
-    # IMPORTANT: After rotation by 90 degrees, the text WIDTH becomes the HEIGHT on screen
-    # So we need to check text_width against max_height
-    max_allowed_height = max_height - 80  # Leave more padding for safety
+    max_allowed_height = max_height - 80
 
-    # Reduce font size until text fits
     iteration = 0
     while text_width > max_allowed_height and current_font.size > 12:
         iteration += 1
-        new_size = int(current_font.size * 0.85)  # Reduce by 15% (more aggressive)
+        new_size = int(current_font.size * 0.85)
         if new_size < 12:
             new_size = 12
-        if iteration == 1:  # Only print on first reduction
+        if iteration == 1:
             print(f"[DEBUG] Text too long ({text_width}px > {max_allowed_height}px), reducing font from {current_font.size} to {new_size}")
         current_font = ImageFont.truetype(str(font_path), size=new_size)
         bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
@@ -931,7 +941,6 @@ def draw_vertical_text(
     if iteration > 0:
         print(f"[DEBUG] Final: font size {current_font.size}, text width {text_width}px")
 
-    # Now draw with the appropriately sized font
     bbox = temp_draw.textbbox((0, 0), combined_text, font=current_font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
@@ -946,11 +955,64 @@ def draw_vertical_text(
     text_y = temp_height // 2
     draw.text((text_x, text_y), combined_text, font=current_font, fill=color, anchor="lm")
 
-    rotated = temp.rotate(90, expand=True)
+    return temp.rotate(90, expand=True)
+
+
+def draw_vertical_text(
+    canvas: Image.Image,
+    text_lines: List[str],
+    position: Tuple[int, int],
+    font: ImageFont.FreeTypeFont,
+    font_path: Path,
+    color: Tuple[int, int, int],
+    max_height: int,
+    random_offset_y: int = 0,
+    random_offset_x: int = 0,
+    x_bounds: Tuple[int, int] | None = None,
+    pre_render: Image.Image | None = None
+) -> None:
+    """
+    Draw vertical text (bottom to top) in the margin.
+    Text is drawn horizontally on a temporary image, rotated, then pasted onto canvas.
+    Supports random_offset_x and random_offset_y for OLED burn-in prevention.
+    If x_bounds is provided, the rotated text will be constrained within (left, right) bounds.
+    Optionally accepts pre_render to reuse a precomputed rotated glyph image.
+    Automatically reduces font size if text is too long to fit in max_height.
+    """
+    if pre_render is None:
+        rotated = prepare_vertical_text_image(text_lines, font, font_path, color, max_height)
+    else:
+        rotated = pre_render
 
     x, y = position
-    x_offset = x + random_offset_x
     y_centered = y + (max_height - rotated.height) // 2 + random_offset_y
+
+    if x_bounds is not None:
+        bound_left, bound_right = x_bounds
+        if bound_left > bound_right:
+            bound_left, bound_right = bound_right, bound_left
+        available_width = bound_right - bound_left
+        if available_width <= 0:
+            base_x = bound_left
+            min_x = bound_left - rotated.width // 2
+            max_x = min_x
+        elif rotated.width >= available_width:
+            base_x = bound_left
+            min_x = bound_left
+            max_x = bound_left
+        else:
+            base_x = bound_left + (available_width - rotated.width) // 2
+            min_x = bound_left
+            max_x = bound_right - rotated.width
+        x_offset = base_x + random_offset_x
+        x_offset = max(min_x, min(x_offset, max_x))
+    else:
+        x_offset = x + random_offset_x
+
+    if rotated.width > 0:
+        x_offset = max(0, min(x_offset, canvas.width - rotated.width))
+    if rotated.height > 0:
+        y_centered = max(0, min(y_centered, canvas.height - rotated.height))
 
     if rotated.width > 0 and rotated.height > 0:
         canvas.paste(rotated, (x_offset, y_centered), rotated)
@@ -1098,27 +1160,73 @@ def layout_wallpaper(
 ) -> None:
     """
     Create a wallpaper layout with two magazine pages side-by-side.
-    Vertical metadata text appears in the right margin of each page.
+    Pages are randomly positioned within their halves (with highlight clipping for OLED safety),
+    and vertical metadata text is placed on whichever side has the most space inside that half.
     """
     canvas_width, canvas_height = resolution
 
     canvas = Image.new("RGB", (canvas_width, canvas_height), WALLPAPER_BACKGROUND)
 
-    available_height = canvas_height - 2 * WALLPAPER_OUTER_MARGIN
-    half_width = (canvas_width - WALLPAPER_CENTER_GAP - 2 * WALLPAPER_OUTER_MARGIN) // 2
-    page_area_width = half_width - WALLPAPER_TEXT_MARGIN_WIDTH
+    available_height = canvas_height
+    top_bound = 0
+    bottom_bound = canvas_height
+    half_width = (canvas_width - WALLPAPER_CENTER_GAP) // 2
+    page_area_width = half_width
+    left_half_left = 0
+    left_half_right = left_half_left + half_width
+    right_half_left = left_half_right + WALLPAPER_CENTER_GAP
+    right_half_right = canvas_width
+
+    left_space_left = 0
+    left_space_right = right_half_left
+    right_space_left = left_half_right
+    right_space_right = canvas_width
 
     font = ensure_font(font_path, size=28)
 
+    def select_text_side(gap_widths: dict[str, int], text_width: int) -> str:
+        fitting = [side for side, width in gap_widths.items() if width >= text_width and width > 0]
+        if fitting:
+            max_width = max(gap_widths[side] for side in fitting)
+            candidates = [side for side in fitting if gap_widths[side] == max_width]
+            return random.choice(candidates)
+        positive = [side for side, width in gap_widths.items() if width > 0]
+        if positive:
+            max_width = max(gap_widths[side] for side in positive)
+            candidates = [side for side in positive if gap_widths[side] == max_width]
+            return random.choice(candidates)
+        if gap_widths:
+            max_width = max(gap_widths.values())
+            candidates = [side for side, width in gap_widths.items() if width == max_width]
+            return random.choice(candidates)
+        return "left"
+
+    text_data1 = {}
+    text_data2 = {}
+
     with Image.open(page_path1) as img1:
         img1 = img1.convert("RGB")
-        fitted1 = fit_image(img1, page_area_width, available_height)
+        img1 = reduce_highlights(img1)
+        if img1.height > 0:
+            scale_to_height = available_height / img1.height
+        else:
+            scale_to_height = 1.0
+        scaled_width1 = max(1, int(img1.width * scale_to_height))
+        scaled_height1 = max(1, int(img1.height * scale_to_height))
+        if scaled_width1 > page_area_width:
+            scale_limit = page_area_width / img1.width if img1.width > 0 else 1.0
+            scaled_width1 = max(1, int(img1.width * scale_limit))
+            scaled_height1 = max(1, int(img1.height * scale_limit))
+        fitted1 = img1.resize((scaled_width1, scaled_height1), Image.LANCZOS)
 
-        # Center the image horizontally within its allocated space, with random offset for burn-in prevention
-        page_offset_x1 = random.randint(-60, 60)
-        page_offset_y1 = random.randint(-40, 40)
-        x1 = WALLPAPER_OUTER_MARGIN + (page_area_width - fitted1.width) // 2 + page_offset_x1
-        y1 = WALLPAPER_OUTER_MARGIN + (available_height - fitted1.height) // 2 + page_offset_y1
+        max_x1 = left_half_right - fitted1.width
+        if max_x1 < left_half_left:
+            max_x1 = left_half_left
+        x1 = random.randint(left_half_left, max_x1)
+        if fitted1.height >= available_height:
+            y1 = top_bound
+        else:
+            y1 = top_bound + (available_height - fitted1.height) // 2
         canvas.paste(fitted1, (x1, y1))
 
         text_lines1 = []
@@ -1131,24 +1239,42 @@ def layout_wallpaper(
         elif metadata1.year:
             text_lines1.append(metadata1.year)
         text_lines1.append(page_label1)
-
-        # Position text at the right edge of the allocated page area
-        text_x1 = WALLPAPER_OUTER_MARGIN + page_area_width + WALLPAPER_TEXT_PADDING
-        text_y1 = WALLPAPER_OUTER_MARGIN
-        offset_y1 = random.randint(-50, 50)
-        offset_x1 = random.randint(-20, 20)
-        draw_vertical_text(canvas, text_lines1, (text_x1, text_y1), font, font_path, INFO_PANEL_TEXT_COLOR, available_height, offset_y1, offset_x1)
+        gap_ranges1 = {
+            "left": (left_space_left, x1),
+            "right": (x1 + fitted1.width, left_space_right),
+        }
+        gap_widths1 = {side: max(0, bounds[1] - bounds[0]) for side, bounds in gap_ranges1.items()}
+        text_image1 = prepare_vertical_text_image(text_lines1, font, font_path, INFO_PANEL_TEXT_COLOR, available_height)
+        text_data1 = {
+            "lines": text_lines1,
+            "ranges": gap_ranges1,
+            "widths": gap_widths1,
+            "image": text_image1,
+        }
 
     with Image.open(page_path2) as img2:
         img2 = img2.convert("RGB")
-        fitted2 = fit_image(img2, page_area_width, available_height)
+        img2 = reduce_highlights(img2)
+        if img2.height > 0:
+            scale_to_height2 = available_height / img2.height
+        else:
+            scale_to_height2 = 1.0
+        scaled_width2 = max(1, int(img2.width * scale_to_height2))
+        scaled_height2 = max(1, int(img2.height * scale_to_height2))
+        if scaled_width2 > page_area_width:
+            scale_limit2 = page_area_width / img2.width if img2.width > 0 else 1.0
+            scaled_width2 = max(1, int(img2.width * scale_limit2))
+            scaled_height2 = max(1, int(img2.height * scale_limit2))
+        fitted2 = img2.resize((scaled_width2, scaled_height2), Image.LANCZOS)
 
-        # Center the image horizontally within its allocated space, with random offset for burn-in prevention
-        page2_left_edge = WALLPAPER_OUTER_MARGIN + half_width + WALLPAPER_CENTER_GAP
-        page_offset_x2 = random.randint(-60, 60)
-        page_offset_y2 = random.randint(-40, 40)
-        x2 = page2_left_edge + (page_area_width - fitted2.width) // 2 + page_offset_x2
-        y2 = WALLPAPER_OUTER_MARGIN + (available_height - fitted2.height) // 2 + page_offset_y2
+        max_x2 = right_half_right - fitted2.width
+        if max_x2 < right_half_left:
+            max_x2 = right_half_left
+        x2 = random.randint(right_half_left, max_x2)
+        if fitted2.height >= available_height:
+            y2 = top_bound
+        else:
+            y2 = top_bound + (available_height - fitted2.height) // 2
         canvas.paste(fitted2, (x2, y2))
 
         text_lines2 = []
@@ -1161,13 +1287,83 @@ def layout_wallpaper(
         elif metadata2.year:
             text_lines2.append(metadata2.year)
         text_lines2.append(page_label2)
+        gap_ranges2 = {
+            "left": (right_space_left, x2),
+            "right": (x2 + fitted2.width, right_space_right),
+        }
+        gap_widths2 = {side: max(0, bounds[1] - bounds[0]) for side, bounds in gap_ranges2.items()}
+        text_image2 = prepare_vertical_text_image(text_lines2, font, font_path, INFO_PANEL_TEXT_COLOR, available_height)
+        text_data2 = {
+            "lines": text_lines2,
+            "ranges": gap_ranges2,
+            "widths": gap_widths2,
+            "image": text_image2,
+        }
 
-        # Position text at the right edge of the allocated page area
-        text_x2 = page2_left_edge + page_area_width + WALLPAPER_TEXT_PADDING
-        text_y2 = WALLPAPER_OUTER_MARGIN
-        offset_y2 = random.randint(-50, 50)
-        offset_x2 = random.randint(-20, 20)
-        draw_vertical_text(canvas, text_lines2, (text_x2, text_y2), font, font_path, INFO_PANEL_TEXT_COLOR, available_height, offset_y2, offset_x2)
+    text_side1 = select_text_side(text_data1["widths"], text_data1["image"].width)
+    text_side2 = select_text_side(text_data2["widths"], text_data2["image"].width)
+
+    if text_side1 == "right" and text_side2 == "left":
+        center_width1 = text_data1["widths"]["right"]
+        center_width2 = text_data2["widths"]["left"]
+        needs_move1 = center_width1 < text_data1["image"].width
+        needs_move2 = center_width2 < text_data2["image"].width
+        moved = False
+        if needs_move1 and text_data1["widths"]["left"] > 0:
+            text_side1 = "left"
+            moved = True
+        if needs_move2 and text_data2["widths"]["right"] > 0:
+            text_side2 = "right"
+            moved = True
+        if not moved:
+            alt_left = text_data1["widths"]["left"]
+            alt_right = text_data2["widths"]["right"]
+            if alt_left > 0 or alt_right > 0:
+                if alt_left >= alt_right and alt_left > 0:
+                    text_side1 = "left"
+                elif alt_right > 0:
+                    text_side2 = "right"
+
+    text_bounds1 = text_data1["ranges"][text_side1]
+    text_anchor_x1 = text_bounds1[0]
+    text_bounds2 = text_data2["ranges"][text_side2]
+    text_anchor_x2 = text_bounds2[0]
+
+    text_y1 = top_bound
+    text_y2 = top_bound
+
+    offset_y1 = random.randint(-50, 50)
+    offset_x1 = random.randint(-20, 20)
+    offset_y2 = random.randint(-50, 50)
+    offset_x2 = random.randint(-20, 20)
+
+    draw_vertical_text(
+        canvas,
+        text_data1["lines"],
+        (text_anchor_x1, text_y1),
+        font,
+        font_path,
+        INFO_PANEL_TEXT_COLOR,
+        available_height,
+        offset_y1,
+        offset_x1,
+        x_bounds=text_bounds1,
+        pre_render=text_data1["image"],
+    )
+
+    draw_vertical_text(
+        canvas,
+        text_data2["lines"],
+        (text_anchor_x2, text_y2),
+        font,
+        font_path,
+        INFO_PANEL_TEXT_COLOR,
+        available_height,
+        offset_y2,
+        offset_x2,
+        x_bounds=text_bounds2,
+        pre_render=text_data2["image"],
+    )
 
     canvas.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
 
