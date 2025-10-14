@@ -13,6 +13,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, List, Set, Tuple, Dict
+import statistics
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError
 
@@ -825,6 +826,82 @@ def filter_pages(
     return kept, removed
 
 
+def filter_aspect_outliers(
+    pages_root: Path,
+    removed_root: Path,
+    tolerance: float,
+    verbose: bool = False,
+) -> Tuple[int, int]:
+    """
+    Move pages whose dimensions or aspect ratios deviate from the median of their issue.
+    Returns (kept, moved).
+    """
+    kept = 0
+    moved = 0
+
+    removed_root.mkdir(parents=True, exist_ok=True)
+    issue_dirs = sorted([p for p in pages_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+
+    for issue_dir in issue_dirs:
+        page_files: List[Path] = []
+        for pattern in ("*.jpg", "*.jpeg", "*.png"):
+            page_files.extend(sorted(issue_dir.glob(pattern), key=page_sort_key))
+        if len(page_files) < 2:
+            kept += len(page_files)
+            continue
+
+        widths: List[int] = []
+        heights: List[int] = []
+        ratios: List[float] = []
+        valid_pages: List[Path] = []
+
+        for page_path in page_files:
+            try:
+                with Image.open(page_path) as img:
+                    width, height = img.size
+            except (UnidentifiedImageError, OSError):
+                if verbose:
+                    print(f"[aspect-filter] Skipping unreadable page {page_path}")
+                continue
+            if width == 0 or height == 0:
+                if verbose:
+                    print(f"[aspect-filter] Skipping zero dimension page {page_path}")
+                continue
+            widths.append(width)
+            heights.append(height)
+            ratios.append(width / height)
+            valid_pages.append(page_path)
+
+        if not valid_pages:
+            continue
+
+        median_width = statistics.median(widths)
+        median_height = statistics.median(heights)
+        median_ratio = statistics.median(ratios)
+
+        issue_removed_dir = removed_root / issue_dir.name
+        issue_removed_dir.mkdir(parents=True, exist_ok=True)
+
+        for page_path, width, height, ratio in zip(valid_pages, widths, heights, ratios):
+            width_diff = abs(width - median_width) / median_width if median_width else 0
+            height_diff = abs(height - median_height) / median_height if median_height else 0
+            ratio_diff = abs(ratio - median_ratio) / median_ratio if median_ratio else 0
+
+            if width_diff > tolerance or height_diff > tolerance or ratio_diff > tolerance:
+                destination = issue_removed_dir / page_path.name
+                if verbose:
+                    print(
+                        f"[aspect-filter] Moving {page_path} -> {destination} "
+                        f"(diffs: w={width_diff:.3f}, h={height_diff:.3f}, r={ratio_diff:.3f})"
+                    )
+                shutil.move(str(page_path), destination)
+                moved += 1
+            else:
+                kept += 1
+
+    return kept, moved
+
+
 def ensure_font(font_path: Path, size: int) -> ImageFont.FreeTypeFont:
     try:
         return ImageFont.truetype(str(font_path), size=size)
@@ -886,6 +963,71 @@ def build_page_label(page_index: int, total_pages: int) -> str:
 
 def build_page_range_label(start_index: int, end_index: int, total_pages: int) -> str:
     return f"Page {start_index}-{end_index}/{total_pages}"
+
+
+def extract_page_number(path: Path) -> int | None:
+    match = re.search(r"(\d+)", path.stem)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def magazine_code(title: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", title.upper())
+    if not tokens:
+        return "MAG"
+    initials = "".join(token[0] for token in tokens if token)
+    if initials:
+        return initials[:3]
+    joined = "".join(tokens)
+    return (joined or "MAG")[:3]
+
+
+def issue_code(metadata: IssueMetadata) -> str:
+    if metadata.issue_number:
+        digits = re.sub(r"\D+", "", metadata.issue_number)
+        if digits:
+            return digits[-3:].zfill(3)
+    if metadata.year and metadata.year.isdigit():
+        return metadata.year[-3:]
+    return "000"
+
+
+def page_code(value: int) -> str:
+    return str(value)[-3:].zfill(3)
+
+
+def build_short_filename(
+    issue_name: str,
+    metadata: IssueMetadata,
+    start_page: int,
+    end_page: int,
+    used: Set[str],
+) -> str:
+    mag_source = metadata.title or issue_name
+    mag_part = magazine_code(mag_source)[:6]
+    issue_part = issue_code(metadata)
+    start_part = page_code(start_page)
+    end_part = page_code(end_page)
+
+    base = f"{mag_part}{issue_part}{start_part}{end_part}"
+    base = re.sub(r"[^A-Za-z0-9]", "", base).upper()
+    if len(base) > 15:
+        base = base[:15]
+    if not base:
+        base = "WALLPAPER"
+    candidate = base
+    counter = 1
+    while candidate in used:
+        suffix = str(counter)
+        head_len = max(1, 15 - len(suffix))
+        candidate = f"{base[:head_len]}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
 
 
 def is_valid_page_aspect(
@@ -1636,7 +1778,7 @@ def generate_wallpaper_matching(
 
     created: List[Path] = []
     used_names: Set[str] = set()
-    candidate_pairs: List[Tuple[Path, Path, IssueMetadata, str]] = []
+    candidate_pairs: List[Tuple[str, Path, Path, IssueMetadata, int, int, int]] = []
 
     issue_dirs = sorted([p for p in pages_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
 
@@ -1647,48 +1789,114 @@ def generate_wallpaper_matching(
         if not page_files:
             continue
 
-        total_pages = len(page_files)
-        if total_pages < 2:
-            continue
-
         metadata = parse_issue_metadata(issue_dir)
+
+        number_to_path: Dict[int, Path] = {}
+        ordered_paths: List[Path] = []
+        for path in page_files:
+            page_number = extract_page_number(path)
+            if page_number is not None and page_number not in number_to_path:
+                number_to_path[page_number] = path
+            ordered_paths.append(path)
+
         aspect_cache: Dict[Path, bool] = {}
 
-        def page_valid(index: int) -> bool:
-            if index < 1 or index > total_pages:
-                return False
-            path = page_files[index - 1]
+        def path_valid(path: Path) -> bool:
             if path not in aspect_cache:
                 aspect_cache[path] = is_valid_page_aspect(path)
             return aspect_cache[path]
 
-        # Cover and back cover pair
-        if page_valid(1) and page_valid(total_pages):
-            candidate_pairs.append(
-                (
-                    page_files[0],
-                    page_files[-1],
-                    metadata,
-                    build_page_range_label(1, total_pages, total_pages),
-                )
-            )
+        if number_to_path:
+            numbers = sorted(number_to_path.keys())
+            if len(numbers) < 2:
+                continue
 
-        # Interior sequential pairs
-        start_index = 2
-        while start_index < total_pages:
-            end_index = start_index + 1
-            if end_index >= total_pages:
-                break
-            if page_valid(start_index) and page_valid(end_index):
+            total_page_number = numbers[-1]
+            cover_number = numbers[0]
+            back_number = numbers[-1]
+            cover_path = number_to_path.get(cover_number)
+            back_path = number_to_path.get(back_number)
+
+            if (
+                cover_path
+                and back_path
+                and cover_number != back_number
+                and path_valid(cover_path)
+                and path_valid(back_path)
+            ):
                 candidate_pairs.append(
                     (
-                        page_files[start_index - 1],
-                        page_files[end_index - 1],
+                        issue_dir.name,
+                        cover_path,
+                        back_path,
                         metadata,
-                        build_page_range_label(start_index, end_index, total_pages),
+                        cover_number,
+                        back_number,
+                        total_page_number,
                     )
                 )
-            start_index += 2
+
+            used_numbers: Set[int] = set()
+            for number in numbers:
+                if number in (cover_number, back_number) or number in used_numbers:
+                    continue
+                partner = number + 1
+                if partner not in number_to_path or partner in used_numbers:
+                    continue
+                left_path = number_to_path[number]
+                right_path = number_to_path[partner]
+                if path_valid(left_path) and path_valid(right_path):
+                    candidate_pairs.append(
+                        (
+                            issue_dir.name,
+                            left_path,
+                            right_path,
+                            metadata,
+                            number,
+                            partner,
+                            total_page_number,
+                        )
+                    )
+                    used_numbers.add(number)
+                    used_numbers.add(partner)
+        else:
+            total_pages = len(ordered_paths)
+            if total_pages < 2:
+                continue
+
+            if path_valid(ordered_paths[0]) and path_valid(ordered_paths[-1]):
+                candidate_pairs.append(
+                    (
+                        issue_dir.name,
+                        ordered_paths[0],
+                        ordered_paths[-1],
+                        metadata,
+                        1,
+                        total_pages,
+                        total_pages,
+                    )
+                )
+
+            start_index = 2
+            while start_index < total_pages:
+                end_index = start_index + 1
+                if end_index > total_pages:
+                    break
+                left_path = ordered_paths[start_index - 1]
+                right_path = ordered_paths[end_index - 1]
+                if path_valid(left_path) and path_valid(right_path):
+                    candidate_pairs.append(
+                        (
+                            issue_dir.name,
+                            left_path,
+                            right_path,
+                            metadata,
+                            start_index,
+                            end_index,
+                            total_pages,
+                        )
+                    )
+                start_index += 2
 
     if not candidate_pairs:
         return created
@@ -1696,9 +1904,10 @@ def generate_wallpaper_matching(
     random.shuffle(candidate_pairs)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    for left_path, right_path, metadata, page_range_label in candidate_pairs:
-        random_name = generate_random_name(used_names)
-        dest = output_root / f"{random_name}.jpg"
+    for issue_name, left_path, right_path, metadata, start_page, end_page, total_pages in candidate_pairs:
+        page_range_label = build_page_range_label(start_page, end_page, total_pages)
+        short_name = build_short_filename(issue_name, metadata, start_page, end_page, used_names)
+        dest = output_root / f"{short_name}.jpg"
 
         layout_wallpaper_matching(
             left_path,
@@ -1785,6 +1994,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Print per-page decisions while filtering.",
     )
 
+    aspect_parser = subparsers.add_parser(
+        "filter-aspect",
+        help="Move pages whose resolution or aspect ratio deviates from the median issue dimensions.",
+    )
+    aspect_parser.add_argument("--input-dir", default="split", help="Directory containing extracted page images.")
+    aspect_parser.add_argument(
+        "--removed-dir",
+        default="removed",
+        help="Directory (relative or absolute) where filtered pages will be moved, preserving issue folders.",
+    )
+    aspect_parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.12,
+        help="Maximum fractional deviation from median width/height/aspect ratio before a page is moved.",
+    )
+    aspect_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print details about pages that are moved or kept.",
+    )
+
     layout_parser = subparsers.add_parser("layout", help="Create 1024x600 single-page layouts or 16:9 wallpapers from extracted images.")
     layout_parser.add_argument("--input-dir", default="split", help="Directory containing extracted page images.")
     layout_parser.add_argument("--output-dir", default="layouts", help="Directory to store generated layouts.")
@@ -1857,6 +2088,19 @@ def main() -> None:
         print(f"{action} {removed} pages; kept {kept}.")
         if not args.apply:
             print("Re-run with --apply to move the flagged pages to 'filtered' subfolders.")
+
+    elif args.command == "filter-aspect":
+        pages_root = Path(args.input_dir)
+        removed_root = Path(args.removed_dir)
+        if not pages_root.exists():
+            parser.error(f"Input directory {pages_root} does not exist.")
+        kept, removed = filter_aspect_outliers(
+            pages_root,
+            removed_root,
+            tolerance=args.tolerance,
+            verbose=args.verbose,
+        )
+        print(f"Moved {removed} outlier pages to {removed_root}; kept {kept}.")
 
     elif args.command == "layout":
         pages_root = Path(args.input_dir)
