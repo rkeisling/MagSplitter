@@ -12,14 +12,14 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, List, Set, Tuple
+from typing import Callable, Iterable, Iterator, List, Set, Tuple, Dict
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageStat, UnidentifiedImageError
 
 CANVAS_SIZE = (1024, 600)
 CANVAS_BACKGROUND = (8, 8, 8)
 INFO_PANEL_BACKGROUND = (20, 20, 20)
-INFO_PANEL_TEXT_COLOR = (107, 225, 5)
+INFO_PANEL_TEXT_COLOR = (64, 160, 0)
 IMAGE_BORDER_COLOR = (40, 40, 40)
 IMAGE_BORDER_WIDTH = 4
 INFO_PANEL_WIDTH = 440
@@ -63,9 +63,9 @@ DEFAULT_SPREAD_THRESHOLD = 1.2
 COLOR_VARIANCE_THRESHOLD = 0.1
 UNIQUE_COLOR_THRESHOLD = 50
 SATURATION_VARIANCE_THRESHOLD = 0.05
-HIGHLIGHT_THRESHOLD = 230
-HIGHLIGHT_REDUCTION_FACTOR = 0.7
-HIGHLIGHT_SOFTNESS = 8
+HIGHLIGHT_THRESHOLD = 242
+HIGHLIGHT_REDUCTION_FACTOR = 0.85
+HIGHLIGHT_SOFTNESS = 2
 
 
 @dataclasses.dataclass
@@ -884,6 +884,44 @@ def build_page_label(page_index: int, total_pages: int) -> str:
     return f"Page {page_index:0{digits}d}/{total_pages:0{digits}d}"
 
 
+def build_page_range_label(start_index: int, end_index: int, total_pages: int) -> str:
+    return f"Page {start_index}-{end_index}/{total_pages}"
+
+
+def is_valid_page_aspect(
+    path: Path,
+    min_ratio: float = DEFAULT_MIN_ASPECT_RATIO,
+    max_ratio: float = DEFAULT_MAX_ASPECT_RATIO,
+) -> bool:
+    try:
+        with Image.open(path) as img:
+            width, height = img.size
+            if height == 0:
+                return False
+            aspect = width / height
+            return min_ratio <= aspect <= max_ratio
+    except (UnidentifiedImageError, OSError):
+        return False
+
+
+def select_gap_for_text(gap_widths: Dict[str, int], text_width: int) -> str:
+    fitting = [side for side, width in gap_widths.items() if width >= text_width and width > 0]
+    if fitting:
+        max_width = max(gap_widths[side] for side in fitting)
+        candidates = [side for side in fitting if gap_widths[side] == max_width]
+        return random.choice(candidates)
+    positive = [side for side, width in gap_widths.items() if width > 0]
+    if positive:
+        max_width = max(gap_widths[side] for side in positive)
+        candidates = [side for side in positive if gap_widths[side] == max_width]
+        return random.choice(candidates)
+    if gap_widths:
+        max_width = max(gap_widths.values())
+        candidates = [side for side, width in gap_widths.items() if width == max_width]
+        return random.choice(candidates)
+    return "right"
+
+
 def reduce_highlights(
     image: Image.Image,
     threshold: int = HIGHLIGHT_THRESHOLD,
@@ -898,9 +936,16 @@ def reduce_highlights(
     else:
         working = image
     luminance = working.convert("L")
-    mask = luminance.point(lambda v: 255 if v >= threshold else 0)
+    range_span = max(1, 255 - threshold)
+
+    def mask_map(value: int) -> int:
+        if value <= threshold:
+            return 0
+        return min(255, int(((value - threshold) / range_span) * 255))
+
+    mask = luminance.point(mask_map)
     if softness > 0:
-        mask = mask.filter(ImageFilter.GaussianBlur(softness))
+        mask = mask.filter(ImageFilter.BoxBlur(softness))
     if mask.getbbox() is None:
         return working
     darker = ImageEnhance.Brightness(working).enhance(factor)
@@ -1184,23 +1229,6 @@ def layout_wallpaper(
 
     font = ensure_font(font_path, size=28)
 
-    def select_text_side(gap_widths: dict[str, int], text_width: int) -> str:
-        fitting = [side for side, width in gap_widths.items() if width >= text_width and width > 0]
-        if fitting:
-            max_width = max(gap_widths[side] for side in fitting)
-            candidates = [side for side in fitting if gap_widths[side] == max_width]
-            return random.choice(candidates)
-        positive = [side for side, width in gap_widths.items() if width > 0]
-        if positive:
-            max_width = max(gap_widths[side] for side in positive)
-            candidates = [side for side in positive if gap_widths[side] == max_width]
-            return random.choice(candidates)
-        if gap_widths:
-            max_width = max(gap_widths.values())
-            candidates = [side for side, width in gap_widths.items() if width == max_width]
-            return random.choice(candidates)
-        return "left"
-
     text_data1 = {}
     text_data2 = {}
 
@@ -1300,8 +1328,8 @@ def layout_wallpaper(
             "image": text_image2,
         }
 
-    text_side1 = select_text_side(text_data1["widths"], text_data1["image"].width)
-    text_side2 = select_text_side(text_data2["widths"], text_data2["image"].width)
+    text_side1 = select_gap_for_text(text_data1["widths"], text_data1["image"].width)
+    text_side2 = select_gap_for_text(text_data2["widths"], text_data2["image"].width)
 
     if text_side1 == "right" and text_side2 == "left":
         center_width1 = text_data1["widths"]["right"]
@@ -1363,6 +1391,125 @@ def layout_wallpaper(
         offset_x2,
         x_bounds=text_bounds2,
         pre_render=text_data2["image"],
+    )
+
+    canvas.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
+
+
+def layout_wallpaper_matching(
+    left_page_path: Path,
+    right_page_path: Path,
+    metadata: IssueMetadata,
+    page_range_label: str,
+    font_path: Path,
+    output_path: Path,
+    resolution: Tuple[int, int],
+    quality: int
+) -> None:
+    canvas_width, canvas_height = resolution
+    canvas = Image.new("RGB", (canvas_width, canvas_height), WALLPAPER_BACKGROUND)
+
+    available_height = canvas_height
+    top_bound = 0
+    half_width = (canvas_width - WALLPAPER_CENTER_GAP) // 2
+    page_area_width = half_width
+    left_half_left = 0
+    left_half_right = left_half_left + half_width
+    right_half_left = left_half_right + WALLPAPER_CENTER_GAP
+    right_half_right = canvas_width
+
+    font = ensure_font(font_path, size=28)
+
+    with Image.open(left_page_path) as left_img:
+        left_img = reduce_highlights(left_img.convert("RGB"))
+        if left_img.height > 0:
+            scale_to_height = available_height / left_img.height
+        else:
+            scale_to_height = 1.0
+        scaled_left_width = max(1, int(left_img.width * scale_to_height))
+        scaled_left_height = max(1, int(left_img.height * scale_to_height))
+        if scaled_left_width > page_area_width:
+            scale_limit = page_area_width / left_img.width if left_img.width > 0 else 1.0
+            scaled_left_width = max(1, int(left_img.width * scale_limit))
+            scaled_left_height = max(1, int(left_img.height * scale_limit))
+        fitted_left = left_img.resize((scaled_left_width, scaled_left_height), Image.LANCZOS)
+
+        max_x_left = left_half_right - fitted_left.width
+        if max_x_left < left_half_left:
+            max_x_left = left_half_left
+        left_x = random.randint(left_half_left, max_x_left)
+        if fitted_left.height >= available_height:
+            left_y = top_bound
+        else:
+            left_y = top_bound + (available_height - fitted_left.height) // 2
+        canvas.paste(fitted_left, (left_x, left_y))
+
+    with Image.open(right_page_path) as right_img:
+        right_img = reduce_highlights(right_img.convert("RGB"))
+        if right_img.height > 0:
+            scale_to_height = available_height / right_img.height
+        else:
+            scale_to_height = 1.0
+        scaled_right_width = max(1, int(right_img.width * scale_to_height))
+        scaled_right_height = max(1, int(right_img.height * scale_to_height))
+        if scaled_right_width > page_area_width:
+            scale_limit = page_area_width / right_img.width if right_img.width > 0 else 1.0
+            scaled_right_width = max(1, int(right_img.width * scale_limit))
+            scaled_right_height = max(1, int(right_img.height * scale_limit))
+        fitted_right = right_img.resize((scaled_right_width, scaled_right_height), Image.LANCZOS)
+
+        max_x_right = right_half_right - fitted_right.width
+        if max_x_right < right_half_left:
+            max_x_right = right_half_left
+        right_x = random.randint(right_half_left, max_x_right)
+        if fitted_right.height >= available_height:
+            right_y = top_bound
+        else:
+            right_y = top_bound + (available_height - fitted_right.height) // 2
+        canvas.paste(fitted_right, (right_x, right_y))
+
+    left_space = (0, left_x)
+    center_space = (left_x + fitted_left.width, right_x)
+    right_space = (right_x + fitted_right.width, canvas_width)
+
+    metadata_lines: List[str] = []
+    if metadata.title:
+        metadata_lines.append(metadata.title)
+    if metadata.issue_number:
+        metadata_lines.append(f"#{metadata.issue_number}")
+    if metadata.month and metadata.year:
+        metadata_lines.append(f"{metadata.month} {metadata.year}")
+    elif metadata.year:
+        metadata_lines.append(metadata.year)
+    metadata_lines.append(page_range_label)
+
+    text_image = prepare_vertical_text_image(metadata_lines, font, font_path, INFO_PANEL_TEXT_COLOR, available_height)
+    gap_ranges = {
+        "left": left_space,
+        "center": center_space,
+        "right": right_space,
+    }
+    gap_widths = {side: max(0, bounds[1] - bounds[0]) for side, bounds in gap_ranges.items()}
+    chosen_gap = select_gap_for_text(gap_widths, text_image.width)
+
+    text_bounds = gap_ranges[chosen_gap]
+    text_anchor_x = text_bounds[0]
+    text_y = top_bound
+    offset_y = random.randint(-50, 50)
+    offset_x = random.randint(-20, 20)
+
+    draw_vertical_text(
+        canvas,
+        metadata_lines,
+        (text_anchor_x, text_y),
+        font,
+        font_path,
+        INFO_PANEL_TEXT_COLOR,
+        available_height,
+        offset_y,
+        offset_x,
+        x_bounds=text_bounds,
+        pre_render=text_image,
     )
 
     canvas.save(output_path, format="JPEG", quality=quality, optimize=True, progressive=True)
@@ -1471,6 +1618,107 @@ def generate_wallpapers(
     return created
 
 
+def generate_wallpaper_matching(
+    pages_root: Path,
+    output_root: Path,
+    font_path: Path,
+    resolution: Tuple[int, int],
+    quality: int,
+    max_wallpapers: int = 0
+) -> List[Path]:
+    """
+    Generate wallpapers by pairing adjacent pages from the same issue:
+    - Cover is paired with the back cover.
+    - Internal pages are paired sequentially (2&3, 4&5, ...).
+    Pages with out-of-range aspect ratios are skipped.
+    """
+    import random
+
+    created: List[Path] = []
+    used_names: Set[str] = set()
+    candidate_pairs: List[Tuple[Path, Path, IssueMetadata, str]] = []
+
+    issue_dirs = sorted([p for p in pages_root.iterdir() if p.is_dir()], key=lambda p: p.name.lower())
+
+    for issue_dir in issue_dirs:
+        page_files: List[Path] = []
+        for pattern in ("*.jpg", "*.jpeg", "*.png"):
+            page_files.extend(sorted(issue_dir.glob(pattern), key=page_sort_key))
+        if not page_files:
+            continue
+
+        total_pages = len(page_files)
+        if total_pages < 2:
+            continue
+
+        metadata = parse_issue_metadata(issue_dir)
+        aspect_cache: Dict[Path, bool] = {}
+
+        def page_valid(index: int) -> bool:
+            if index < 1 or index > total_pages:
+                return False
+            path = page_files[index - 1]
+            if path not in aspect_cache:
+                aspect_cache[path] = is_valid_page_aspect(path)
+            return aspect_cache[path]
+
+        # Cover and back cover pair
+        if page_valid(1) and page_valid(total_pages):
+            candidate_pairs.append(
+                (
+                    page_files[0],
+                    page_files[-1],
+                    metadata,
+                    build_page_range_label(1, total_pages, total_pages),
+                )
+            )
+
+        # Interior sequential pairs
+        start_index = 2
+        while start_index < total_pages:
+            end_index = start_index + 1
+            if end_index >= total_pages:
+                break
+            if page_valid(start_index) and page_valid(end_index):
+                candidate_pairs.append(
+                    (
+                        page_files[start_index - 1],
+                        page_files[end_index - 1],
+                        metadata,
+                        build_page_range_label(start_index, end_index, total_pages),
+                    )
+                )
+            start_index += 2
+
+    if not candidate_pairs:
+        return created
+
+    random.shuffle(candidate_pairs)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    for left_path, right_path, metadata, page_range_label in candidate_pairs:
+        random_name = generate_random_name(used_names)
+        dest = output_root / f"{random_name}.jpg"
+
+        layout_wallpaper_matching(
+            left_path,
+            right_path,
+            metadata,
+            page_range_label,
+            font_path,
+            dest,
+            resolution,
+            quality,
+        )
+
+        created.append(dest)
+
+        if max_wallpapers > 0 and len(created) >= max_wallpapers:
+            break
+
+    return created
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Split CBZ/CBR/PDF issues into page images and craft 1024x600 layouts.",
@@ -1548,9 +1796,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     layout_parser.add_argument(
         "--mode",
-        choices=["single", "wallpaper"],
+        choices=["single", "wallpaper", "wallpaper-matching"],
         default="single",
-        help="Layout mode: 'single' for 1024x600 WigiDash layout, 'wallpaper' for 16:9 dual-page wallpapers.",
+        help=(
+            "Layout mode: 'single' for 1024x600 WigiDash layout, 'wallpaper' for random dual-issue pairings, "
+            "or 'wallpaper-matching' for adjacent page pairs."
+        ),
     )
     layout_parser.add_argument(
         "--wallpaper-resolution",
@@ -1616,16 +1867,24 @@ def main() -> None:
         if not font_path.exists():
             parser.error(f"Font file {font_path} does not exist.")
 
-        if args.mode == "wallpaper":
+        if args.mode in {"wallpaper", "wallpaper-matching"}:
             resolution = WALLPAPER_4K_SIZE if args.wallpaper_resolution == "4k" else WALLPAPER_1440P_SIZE
-            created = generate_wallpapers(
-                pages_root, output_root, font_path,
-                resolution, args.wallpaper_quality, args.max_wallpapers
-            )
-            if not created:
-                print("No page images found. Run the split command first.")
+            if args.mode == "wallpaper":
+                created = generate_wallpapers(
+                    pages_root, output_root, font_path,
+                    resolution, args.wallpaper_quality, args.max_wallpapers
+                )
+                mode_label = "wallpapers"
             else:
-                print(f"Created {len(created)} {args.wallpaper_resolution} wallpapers under {output_root}")
+                created = generate_wallpaper_matching(
+                    pages_root, output_root, font_path,
+                    resolution, args.wallpaper_quality, args.max_wallpapers
+                )
+                mode_label = "matched wallpapers"
+            if not created:
+                print("No eligible page pairs found. Check your source pages or split settings.")
+            else:
+                print(f"Created {len(created)} {args.wallpaper_resolution} {mode_label} under {output_root}")
         else:
             created = generate_layouts(pages_root, output_root, font_path, args.flatten)
             if not created:
